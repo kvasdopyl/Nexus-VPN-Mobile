@@ -1,0 +1,4 @@
+<paths>
+    <files-path name="updates" path="data/run/updates/" />
+    <cache-path name="cache" path="." />
+</paths>

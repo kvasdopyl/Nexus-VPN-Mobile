@@ -1,0 +1,158 @@
+"""Persistent application settings with sane defaults and migration-safe loading."""
+from __future__ import annotations
+
+import copy
+import json
+import threading
+from typing import Any
+
+from .paths import SETTINGS_FILE, ensure_dirs
+
+DEFAULTS: dict[str, Any] = {
+    # ---- engine / capture ----
+    "capture_mode": "tun",            # tun | system_proxy | both
+    "tun_stack": "gvisor",            # gvisor | mixed | system; gvisor needs no firewall rule on Windows
+    "tun_mtu": 1400,                  # <=1400 avoids fragmentation on most LTE/DSL paths
+    "tun_ipv4": "172.19.0.1/30",
+    "strict_route": True,             # blocks leaks via other interfaces
+    "auto_detect_interface": True,
+    "endpoint_independent_nat": True,
+    "udp_timeout": "5m",              # voice calls survive long silences
+    "mixed_port": 2080,
+    "clash_api_port": 9090,
+    "clash_secret": "",
+    "block_quic_direct": True,        # browsers fall back to TCP instead of a dead QUIC
+    "ipv6_mode": "off",               # off | prefer | only -> off avoids broken IPv6 leaks
+
+    # ---- routing ----
+    "routing_mode": "smart",          # smart | global | custom
+    "custom_use_presets": False,      # custom mode: also apply the built-in rule bases
+    "learn_enabled": True,
+    "learn_auto_apply": True,         # auto-promote proven-blocked domains without asking
+    "learn_probe_interval": 20,       # seconds a direct connection may stay silent
+    "learn_min_bytes": 4096,
+    "learn_workers": 6,
+    "learn_apps": True,               # learn per application as well as per domain
+    "russian_blocked_presets": True,  # seed with RU-blocked geosite/geoip
+    "preset_discord": True,
+    "preset_youtube": True,
+    "preset_telegram": True,
+    "preset_ai": True,                # openai/anthropic/google-ai etc.
+    "preset_meta": True,
+    "preset_twitter": True,
+    "preset_instagram": True,
+    "preset_whatsapp": True,
+    "preset_steam_direct": True,      # Steam downloads direct = faster
+    "discord_isolate": True,          # own selector for Discord, picks a UDP-capable node
+    "discord_node": "",               # "" = best node that carries UDP natively; else a node tag
+    "local_services_direct": True,
+
+    # ---- dns ----
+    "dns_local": "77.88.8.8",
+    "dns_local_alt": "1.1.1.1",
+    "dns_remote": "https://1.1.1.1/dns-query",
+    "dns_remote_alt": "https://dns.google/dns-query",
+    "dns_strategy": "ipv4_only",
+    "dns_fakeip": False,
+
+    # ---- nodes / subscriptions ----
+    "subscriptions": [],
+    "active_node": "",
+    "auto_selector": True,
+    "health_check_url": "https://www.gstatic.com/generate_204",
+    "health_check_interval": 180,
+    "auto_switch_failures": 3,
+    "sub_auto_update_hours": 12,
+
+    # ---- quality of life ----
+    "core_auto_update": True,
+    "app_update_check": True,         # look for new Nexus VPN Mobile builds on GitHub every 6 h
+    "app_update_auto": False,         # install them without asking (not during a call)
+    "update_repo": "",                # empty = the repository this build came from
+    "update_token": "",               # only for a private repository
+    "update_notified_build": 0,
+    "last_run_build": 0,
+    "rules_auto_update": True,
+    "start_minimized": False,
+    "openvpn_exe": "",                # empty = auto-detect C:\\Program Files\\OpenVPN\\bin\\openvpn.exe
+    "was_connected": True,            # reconnect automatically on next launch
+    "autostart": False,
+    "log_level": "info",
+    "log_max_mb": 8,
+    "bypass_lan": True,
+    "process_exclusions": [],         # never routed through VPN
+    "process_force_vpn": [],          # always through VPN
+    # games: preset key -> off | direct | proxy (the user turns on what they play)
+    "games": {},
+    "custom_games": [],               # [{"name", "match" (folder or .exe path), "mode"}]
+    # full: only VPN destinations enter the TUN, everything else never touches the program;
+    # core: everything enters the TUN and the program sends direct traffic out itself
+    "direct_bypass": "full",
+    # «Системный прокси»: a small TUN only for Discord and Telegram so voice and calls work too
+    "proxy_voice_tun": True,
+}
+
+
+class Settings:
+    """Thread-safe settings store with dotted access and atomic saves."""
+
+    def __init__(self, path=None):
+        ensure_dirs()
+        self._path = path or SETTINGS_FILE
+        self._lock = threading.RLock()
+        self.data = copy.deepcopy(DEFAULTS)
+        self.load()
+
+    # ---------- io ----------
+    def load(self) -> None:
+        try:
+            raw = json.loads(self._path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return
+        with self._lock:
+            self.data.update(raw)
+            if self.data.get("routing_mode") in ("rules", "direct"):
+                self.data["routing_mode"] = "custom"
+            # 2.0.0 shipped "mixed": its system TCP stack is silently blocked by Windows Firewall
+            if not self.data.get("migrated_stack_v201"):
+                if self.data.get("tun_stack") == "mixed":
+                    self.data["tun_stack"] = "gvisor"
+                self.data["migrated_stack_v201"] = True
+            # 2.1.1 had one switch for all games; 2.2 asks per game. Keep what the user relied on.
+            if "games" not in raw and raw.get("games_direct", False):
+                self.data["games"] = {"cod": "direct", "battlenet": "direct"}
+            for old in ("games_direct", "game_folders"):
+                self.data.pop(old, None)
+            # forward-compatible: add new default keys
+            for k, v in DEFAULTS.items():
+                self.data.setdefault(k, copy.deepcopy(v))
+
+    def save(self) -> None:
+        with self._lock:
+            tmp = self._path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), "utf-8")
+            tmp.replace(self._path)
+
+    # ---------- access ----------
+    def get(self, key: str, default=None):
+        with self._lock:
+            return self.data.get(key, DEFAULTS.get(key, default))
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            self.data[key] = value
+
+    def update(self, **kw) -> None:
+        with self._lock:
+            self.data.update(kw)
+
+    def __getitem__(self, key):
+        return self.get(key)
+
+    def __setitem__(self, key, value):
+        self.set(key, value)
+
+    def reset(self) -> None:
+        with self._lock:
+            self.data = copy.deepcopy(DEFAULTS)
+        self.save()

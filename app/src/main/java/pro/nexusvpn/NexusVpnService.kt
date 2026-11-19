@@ -6,8 +6,6 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.IpPrefix
-import android.net.LinkProperties
-import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
@@ -58,7 +56,6 @@ class NexusVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     private val lock = Any()
     private var server: CommandServer? = null
     private var tun: ParcelFileDescriptor? = null
-    private var netCallback: ConnectivityManager.NetworkCallback? = null
     private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
 
     override fun onCreate() {
@@ -86,6 +83,7 @@ class NexusVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         synchronized(lock) {
             try {
                 closeCore()
+                NetworkMonitor.start()
                 val s = CommandServer(this, this)
                 s.start()
                 server = s
@@ -126,8 +124,7 @@ class NexusVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         server = null
         runCatching { tun?.close() }
         tun = null
-        netCallback?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
-        netCallback = null
+        NetworkMonitor.stop()
     }
 
     private fun stopSelfCompletely() {
@@ -235,29 +232,11 @@ class NexusVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     }
 
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
-        fun push(network: Network?) {
-            val lp: LinkProperties? = network?.let { connectivity.getLinkProperties(it) }
-            val name = lp?.interfaceName
-            if (name == null) {
-                listener.updateDefaultInterface("", -1, false, false)
-                return
-            }
-            val index = runCatching { NetworkInterface.getByName(name).index }.getOrDefault(-1)
-            listener.updateDefaultInterface(name, index, false, false)
-        }
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = push(network)
-            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = push(network)
-            override fun onLost(network: Network) = push(null)
-        }
-        netCallback = cb
-        connectivity.registerDefaultNetworkCallback(cb)
-        push(connectivity.activeNetwork)
+        NetworkMonitor.setListener(listener)
     }
 
     override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
-        netCallback?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
-        netCallback = null
+        NetworkMonitor.setListener(null)
     }
 
     override fun getInterfaces(): NetworkInterfaceIterator {
@@ -308,7 +287,7 @@ class NexusVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     override fun includeAllNetworks(): Boolean = false
     override fun clearDNSCache() {}
     override fun readWIFIState(): WIFIState? = null
-    override fun localDNSTransport(): LocalDNSTransport? = null
+    override fun localDNSTransport(): LocalDNSTransport = LocalResolver
     override fun sendNotification(notification: BoxNotification) {}
     override fun cancelNotification(identifier: String, typeID: Int) {}
     override fun startNeighborMonitor(listener: NeighborUpdateListener) {}

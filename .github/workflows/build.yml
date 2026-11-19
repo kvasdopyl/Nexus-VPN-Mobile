@@ -1,0 +1,130 @@
+name: build
+
+# Every change pushed to main (including files uploaded through the GitHub website) builds the APK and
+# publishes a release. Installed copies of Nexus VPN Mobile find it and offer to update.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  SING_BOX_VERSION: v1.14.4
+  GOMOBILE_VERSION: v0.1.13
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Chaquopy needs the same Python version on the build machine as inside the app
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Tests (the phone config is checked by the real sing-box; no psutil, like on the phone)
+        run: |
+          pip install -q pytest certifi
+          curl -sL "https://github.com/SagerNet/sing-box/releases/download/${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION#v}-linux-amd64.tar.gz" | tar xz
+          SINGBOX=$PWD/sing-box-${SING_BOX_VERSION#v}-linux-amd64/sing-box python -m pytest -q tests
+          rm -rf sing-box-*
+
+      - name: Cached sing-box core for Android
+        id: libbox
+        uses: actions/cache@v4
+        with:
+          path: app/libs/libbox.aar
+          key: libbox-${{ env.SING_BOX_VERSION }}-arm64-v1
+
+      - uses: actions/setup-go@v5
+        if: steps.libbox.outputs.cache-hit != 'true'
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Build the sing-box core for Android (first build only, ~15 min)
+        if: steps.libbox.outputs.cache-hit != 'true'
+        run: |
+          go install github.com/sagernet/gomobile/cmd/gomobile@${GOMOBILE_VERSION}
+          go install github.com/sagernet/gomobile/cmd/gobind@${GOMOBILE_VERSION}
+          export PATH=$PATH:$(go env GOPATH)/bin
+          export ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}
+          git clone --depth 1 --branch ${SING_BOX_VERSION} https://github.com/SagerNet/sing-box.git /tmp/sing-box
+          cd /tmp/sing-box
+          gomobile init
+          gomobile bind -o libbox.aar -target android/arm64 -androidapi 24 -javapkg=io.nekohasekai -libname=box \
+            -trimpath -buildvcs=false \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${SING_BOX_VERSION#v} -checklinkname=0 -s -w -buildid=" \
+            -tags "with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0" \
+            ./experimental/libbox
+          mkdir -p "$GITHUB_WORKSPACE/app/libs"
+          cp libbox.aar "$GITHUB_WORKSPACE/app/libs/libbox.aar"
+
+      - name: Stamp version and build number
+        id: ver
+        run: |
+          v=$(python tools/stamp.py ${{ github.run_number }} ${{ github.repository }})
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Version $v"
+
+      - name: Signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          # with the secret, releases are signed by your private key; without it, by nexusvpn.keystore from the repository
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "NEXUS_KEYSTORE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+          fi
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      - name: Build APK
+        env:
+          NEXUS_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          NEXUS_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          NEXUS_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          for v in NEXUS_KEYSTORE_PASSWORD NEXUS_KEY_ALIAS NEXUS_KEY_PASSWORD; do [ -z "${!v}" ] && unset $v; done
+          gradle --no-daemon :app:assembleRelease
+          mkdir -p out
+          cp app/build/outputs/apk/release/app-release.apk "out/Nexus-VPN-Mobile-${{ steps.ver.outputs.version }}.apk"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nexus-VPN-Mobile-${{ steps.ver.outputs.version }}
+          path: out/*.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Nexus VPN Mobile ${{ steps.ver.outputs.version }}
+          make_latest: true
+          body: |
+            Скачайте **Nexus-VPN-Mobile-${{ steps.ver.outputs.version }}.apk** на телефон и откройте его.
+            Android попросит разрешить установку из этого источника — разрешите. Уже установленное приложение
+            обновится поверх, настройки сохранятся.
+
+            Нужен Android 7 или новее, 64-битный телефон.
+
+            Изменение: ${{ github.event.head_commit.message || 'ручной запуск сборки' }}
+          files: out/*.apk

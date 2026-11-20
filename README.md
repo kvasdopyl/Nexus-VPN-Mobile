@@ -1,3 +1,6 @@
+
+**Nexus-VPN для виндовс https://github.com/kvasdopyl/NexusVPN-Pro**
+
 # Nexus VPN Mobile
 
 VPN-клиент для Android с умной самообучающейся маршрутизацией (Smart Auto-Split Tunneling).
